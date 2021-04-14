@@ -370,6 +370,8 @@ class Worker:
         args: Tuple[Any, ...] = ()
         kwargs: Dict[Any, Any] = {}
 
+        result_timeout_s = self.keep_result_s
+
         async def job_failed(exc: Exception) -> None:
             self.jobs_failed += 1
             result_data_ = serialize_result(
@@ -385,7 +387,7 @@ class Worker:
                 ref=f'{job_id}:{function_name}',
                 serializer=self.job_serializer,
             )
-            await asyncio.shield(self.abort_job(job_id, result_data_))
+            await asyncio.shield(self.abort_job(job_id, result_data_, result_timeout_s))
 
         if not v:
             logger.warning('job %s expired', job_id)
@@ -404,6 +406,8 @@ class Worker:
         except KeyError:
             logger.warning('job %s, function %r not found', job_id, function_name)
             return await job_failed(JobExecutionFailed(f'function {function_name!r} not found'))
+
+        result_timeout_s = self.keep_result_s if function.keep_result_s is None else function.keep_result_s
 
         if hasattr(function, 'next_run'):
             # cron_job
@@ -433,7 +437,7 @@ class Worker:
                 ref,
                 serializer=self.job_serializer,
             )
-            return await asyncio.shield(self.abort_job(job_id, result_data))
+            return await asyncio.shield(self.abort_job(job_id, result_data, result_timeout_s))
 
         result = no_result
         exc_extra = None
@@ -492,7 +496,6 @@ class Worker:
             finish = True
             self.jobs_complete += 1
 
-        result_timeout_s = self.keep_result_s if function.keep_result_s is None else function.keep_result_s
         result_data = None
         if result is not no_result and result_timeout_s > 0:
             result_data = serialize_result(
@@ -533,14 +536,14 @@ class Worker:
             tr.delete(*delete_keys)
             await tr.execute()
 
-    async def abort_job(self, job_id: str, result_data: Optional[bytes]) -> None:
+    async def abort_job(self, job_id: str, result_data: Optional[bytes], result_timeout_s: float) -> None:
         with await self.pool as conn:
             await conn.unwatch()
             tr = conn.multi_exec()
             tr.delete(retry_key_prefix + job_id, in_progress_key_prefix + job_id, job_key_prefix + job_id)
             tr.zrem(self.queue_name, job_id)
             # result_data would only be None if serializing the result fails
-            if result_data is not None and self.keep_result_s > 0:  # pragma: no branch
+            if result_data is not None and result_timeout_s > 0:  # pragma: no branch
                 tr.setex(result_key_prefix + job_id, self.keep_result_s, result_data)
             await tr.execute()
 
